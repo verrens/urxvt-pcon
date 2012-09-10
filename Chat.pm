@@ -190,22 +190,6 @@ def unuse => sub ($) {#{{{
 #}}}
 #}}}
 
-## Net#{{{
-def macgen=>sub ($) { join ":"#{{{
-                    , grep length == 2
-                    , split /(.{2})/
-                    , md5sum(shift)
-                    , 6 };#}}}
-def macrnd => sub () { join(":", "00", #{{{
-                        ("22", "01", "04") [rand(3)], # SFWM
-                        map {sprintf "%2.2X", rand(255)} (1..4)) }; #}}}
-def wthset => sub () { " ip link set dev wth"#{{{
-                      ." arp off multicast off dynamic off"
-                      ." address ".macrnd() };#}}}
-def vlanadd => sub () { " ip link add link wth name ".shift#{{{
-                       ." type vlan id ".shift };#}}}
-#}}}
-
 ## Shotcuts #{{{
 def f => sub (@) { map ref()?&$_:$_, @_ }; # Just f
 # Paste to terminal: shotcut
@@ -254,10 +238,6 @@ def sl => sub () { head(selarea()) };
 def l => sub (@) { map term()->ROW_t($_), scalar @_ ? @_ : sl() };
 #}}}
 
-#Veryshotcut#{{{
-def tpn => sub { bag(tp=>newtermpty(shift || 'Unit 22')) };
-def tp => sub { bag('tp')->[1] };
-#}}}
 def pty => sub {#{{{
     open my $f, '+>&=', shift || term->env->{'URXVT_PTY'}
         || die "Where I am?";
@@ -300,130 +280,6 @@ def iowt => sub {
                 })
         ->start
     };
-#}}}
-## AnyEvent#{{{
-def http_connect => sub ($&;@) {#{{{
-  my ($h, $f, $r, $p) = @_;
-  $h =~ /([\w\d\.]+):(\d+)$/ and ($h, $p) = ($1, $2);
-  require AnyEvent::Socket;
-  AnyEvent::Socket::tcp_connect($h, $p || "http",
-    sub {
-      # See man AnyEvent::Socket
-      my ($fh) = @_
-        or die "unable to connect: $!";
-
-      my $handle; # avoid direct assignment so on_eof has it in scope.
-      require AnyEvent::Handle;
-      $handle = new AnyEvent::Handle
-      fh     => $fh,
-      on_error => sub {
-        warn "on_error: $_[2]";
-        $_[0]->destroy;
-      },
-      on_eof => sub {
-        $handle->destroy; # destroy handle
-        warn "done.";
-      };
-
-      $handle->push_write (($r || "GET / HTTP/1.0")
-        ."\015\012\015\012");
-
-      $handle->push_read (line => "\015\012\015\012", sub {
-          my ($handle, $line) = @_;
-
-          # print response header
-          print "HEADER\n$line\n\nBODY\n";
-
-          $handle->on_read (sub {
-              # print response body
-              ($f or sub { die "undef: @_" })->(
-                $_[0]->rbuf, @_);
-              $_[0]->rbuf = ""; # FIXME ???
-            });
-        });
-    }
-  )};
-#}}}
-def test_anyevent => sub (\&) {#{{{
-  my $f=shift || sub { warn "? ".substr shift, 0, 80 };
-  http_connect( "127.0.0.1",
-                sub { &$f },
-                "GET /debian/dists/stable/Release HTTP/1.0", "3180" )};
-#}}}
-def http_connect => sub ($&;@) {#{{{
-  my ($h, $f, $r, $p) = @_;
-  $h =~ /([\w\d\.]+):(\d+)$/ and ($h, $p) = ($1, $2);
-  require AnyEvent::Socket;
-  AnyEvent::Socket::tcp_connect($h, $p || "http",
-    sub {
-      # See man AnyEvent::Socket
-      my ($fh) = @_
-        or die "unable to connect: $!";
-
-      my $handle; # avoid direct assignment so on_eof has it in scope.
-      require AnyEvent::Handle;
-      $handle = new AnyEvent::Handle
-      fh     => $fh,
-      on_error => sub {
-        warn "on_error: $_[2]";
-        $_[0]->destroy;
-      },
-      on_eof => sub {
-        $handle->destroy; # destroy handle
-        warn "done.";
-      };
-
-      $handle->push_write (($r || "GET / HTTP/1.0")
-        ."\015\012\015\012");
-
-      $handle->push_read (line => "\015\012\015\012", sub {
-          my ($handle, $line) = @_;
-
-          # print response header
-          print "HEADER\n$line\n\nBODY\n";
-
-          $handle->on_read (sub {
-              # print response body
-              ($f or sub { die "undef: @_" })->(
-                $_[0]->rbuf, @_);
-              $_[0]->rbuf = ""; # FIXME ???
-            });
-        });
-    }
-  )};
-#}}}
-def ws => sub {#{{{
-  # FIXME xexe..
-  use lib '/home/den/dev/perl/lib';
-  unuse('WS/Server');
-  require WS::Server;
-  require WS::Driver::AnyEvent;
-  require WS::Channel;
-  WS::Channel::setup_rpc(WS::Server->new(
-      -driver=>'WS::Driver::AnyEvent', @_))
-};
-#}}}
-def wsallevents => sub { map "-on_$_",#{{{
-  qw(connect disconnect error open close msg) };
-#}}}
-def wsflushevents => sub { map $_[0]->Flush($_), wsallevents() };
-def wsdbg => sub {#{{{
-  # FIXME Extend method -> $self only!
-  # TODO This is only one documentation about WS::Server!!
-  (shift||ws())->Extend(
-    -on_json=>sub { my ($c, $k, %m)=@_;
-      warn "[", ts(), "] $k -> {", (join ", ",
-        map "$_: ".d($m{$_}), sort keys %m), "}\n" }
-    , map { my $k=$_; $k => sub { shift; warn "ws $k: @_\n" } } wsallevents()
-  )};
-#}}}
-def wseval=>sub{shift->say_json(bag('curws'), cmd=>'eval', code=>"@_")};
-def m2con =>sub { my ($f, @a) = @_; M2::Api::AnyEvent->connect(#{{{
-    -on_open => sub { for (my $m=shift) {
-        $m->init('perl', sub { $f->($m, @_, @a) })}},
-    -on_close => sub { ref $a[-1] && $a[-1]->(@_) }
-  )};
-#}}}
 #}}}
 
 sub main () {#{{{
