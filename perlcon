@@ -1,0 +1,805 @@
+#! /usr/bin/perl
+## URXVT perl 'meta' console, copyright (c) 2011 Afonin Denis <verrens@cpan.org>
+use locale;
+use Encode;
+use Scalar::Util qw/weaken/;
+use Tie::Watch; # TODO implement via tie
+use Data::Dumper;
+use Symbol qw(delete_package);
+
+use constant {
+    HOME => (getpwuid($<))[7],
+    BOOTSTRAP_MOD => 'Chat',
+};
+use constant {
+    LIBDIR => HOME."/.urxvt/perl",
+};
+
+## TODO#{{{
+# * DIRTY!!!!!! (devide et empera)
+# * Persistent stashes
+# * Prototypes!
+# * PAGER!!!!!!!!!!
+# ** Scroll
+#
+# * Widget factory (and API)
+# * Resident model? (wtf?)
+# * Variable console widget size
+# * Removing widgets properly
+# * Configurable (via x_resource?)
+# * Normal screen layout (like vi?)
+# * Edit - long lines (multiline or horizontal scroll?)
+# * History - searching
+# * Pager (more or less?) Wrap
+# * Keys mapping (system)
+# * Mouse copying
+# * Security: signing bootstrap mod
+# }}}
+
+# FIXME Take it away!!!
+
+## urxvt callbacks {{{
+sub on_init {
+    my $self = shift;
+    my $con_create = time;
+    my @lastrv;
+
+    # FIXME Configurable
+    my $color = urxvt::SET_COLOR(urxvt::OVERLAY_RSTYLE, 77, 1); 
+
+    my $hotkey = $self->{argv}[0]
+        || $self->x_resource ("perlcon-key")
+        || "M-semicolon";
+
+    $self->parse_keysym ($hotkey, "perl:perlcon")
+        or warn "unable to register '$hotkey' as perlcon start hotkey\n";
+
+    # TODO Ugly!
+    my $p = __PACKAGE__."::".(
+       "$self" =~ /0x([\da-f]+)/ and $1 or rand(2<<15));
+    # TODO This is a 'kernel', what's BOOTSTRAP_MOD?
+    # $e->(<cmd_name> => sub { ..}, @args)
+    my $e = sub ($&@) {
+        no strict 'refs';
+        # FIXME name checking!
+        my ($n, $f, @a) = @_;
+        *{$p."::".$n} = sub { $f->(@_, @a) };
+        use strict # Hardly, yes.
+    };
+    my $b = "BEGIN { "
+        . "  package $p;"
+        . "  use warnings;"
+        . "  use strict;"
+        # TODO Security (\' in $HOME)
+        . "  use lib ('".LIBDIR."');"
+        # FIXME Ugly
+        . '  delete $INC{"'.BOOTSTRAP_MOD.'.pm"};'
+        . '  require '.BOOTSTRAP_MOD.';'
+        . '  main() }';
+    # TODO Clearing eval magic (it's realy possible?)
+    my $c = sub { "do {package $p; no strict 'subs'; @_}" };
+
+    my %cbs;
+    my %scbs;
+    my $booted;
+    my $bootat;
+    my $bootreason;
+    my $state;
+    # All modules interferenting via funs
+    my %modules;
+    %scbs = (
+        def => sub ($&@) { $e->(@_) },
+        defs => sub () { \%cbs },
+        term => sub () { $self },
+    );
+    %cbs = (
+        # A-la syscalls :) Parasitic-OS class.
+        def => sub ($&@) { $e->(@_) },
+        # FIXME Strange name
+        call => sub (;@) {
+            my $k = shift or return keys %cbs;
+            ($cbs{$k} || sub { warn "Unknown $k" })->(@_)
+        },
+        # FIXME Remove it far-far away!!!
+        term => sub () { $self },
+        con => sub (;@) {
+            my $k = shift
+                or return keys %{$self->{con}};
+            ($self->{con}->{$k} || sub { warn "Unknown $k" })->(@_)
+        },
+        state => sub (;$) { @_ ? do { $_=$state;
+                $state = shift; $_ } : $state },
+        reboot => sub (;$) { 
+            $e->($_ => $cbs{$_})
+                for keys %cbs;
+            $bootat=time;
+            $booted++;
+            $bootreason=shift if @_;
+            # Real bootstrapping...
+            $state = eval $b;
+            warn "Bootstraping error $@" if $@
+        },
+        lsmod => sub () { keys %modules },
+        rmmod => sub ($) {
+            warn "Removing module @_ ";
+            delete $modules{+shift} ? 1 : (
+                (warn "rmmod: no such module"), ()) },
+        # insmod <name> => sub (\%) { 
+        insmod => sub ($&) {
+            my $n = shift."";
+            warn "insmod: overwrite $n" if $modules{$n};
+            $modules{$n} = shift;
+            # FIXME Dirty...
+            $modules{$n}->(\%scbs) }, 
+        uptime => sub () { time - $bootat || time,
+            wantarray && (time - $con_create, $booted) },
+        bootreason => sub () { $bootreason }, # FIXME weak
+#         say => sub ($) { term->tt_paste(term->locale_encode ("@_"||$_||"")) },
+#         listen => sub (&) { warn "listen @_"; shift->(@_) },
+#         console => sub () { $self->{con} },
+        last_result => sub () { weaken \@lastrv },
+        paste_term => sub {
+            $self->{paste} = join "\n",
+                map { (my $v = $_) =~ tr/\n\r//ds; $v }
+                    scalar @_ ? @_ : @{$self->{con}->{last_result}->()};
+            1
+        },
+    );
+    $self->{con} = urxvt_perlcon(
+        -on_eval => sub ($) {
+            my $cmd = shift;
+            local @_ = @lastrv;
+            our @a; # Accumulator
+            our %a; # Another accumulator
+            # TODO Filtering
+            my $__;
+            my @rv = map { split "\n", "$_" }
+                do {
+                    local $_ = @_[0];
+                    @_ = eval $c->($cmd);
+                    $__ = $_ if $_ ne $__;
+                    @lastrv = @_ unless $@;
+                    @_
+                };
+# TODO                if ($__ and $lastrv[0] ne $__) {
+#                     warn "Using \$_=$__ instead of \@[0]_=@lastrv[0]";
+#                     $lastrv[0] = $__
+#                 }
+            die $@ if $@;
+            @rv
+        },
+        -on_activate => sub () {
+            # Try to be lazy
+            $booted || $cbs{reboot}->()
+        },
+        -urxvt => $self,
+        -width => 5, # FIXME variable
+        -color => $color,
+        -color_rv => $color,
+        -color_cmd => urxvt::SET_FGCOLOR($color, 4),
+        -color_err => urxvt::SET_FGCOLOR($color, 11),
+        -color_warn => urxvt::SET_FGCOLOR($color, 58),
+    ) or die "Create console fail";
+    # TODO Binding (move to high level?)
+    $self->hook_add(
+        x_key_press_Escape => sub { $self->leave; 1 },
+    );
+    ()
+}
+
+sub on_user_command {
+    my ($self, $cmd) = @_;
+    $self->enter
+        if $cmd eq "perlcon";
+    ()
+}
+
+## Enter/leave {{{
+sub enter {
+    my $self = shift;
+    if ($self->{entered}) {
+        $self->leave;
+        return
+    }
+    $self->{entered}++;
+    urxvt::verbose(3, "Enter");
+
+    $self->hooks_activate(); # TODO resident mode
+
+    do { warn "Can`t enter: nobody home"; return }
+        unless $self->{con};
+    $self->{con}->{active}->(1);
+}
+
+sub leave {
+    my ($self) = @_;
+    return unless $self->{entered};
+
+    $self->hooks_deactivate();
+    undef $self->{entered};
+
+    do { warn "Hmm, where I am?"; return }
+        unless $self->{con};
+    $self->{con}->{active}->(0);
+
+    # FIXME hack
+    if ($self->{paste}) {
+        urxvt::verbose(3, "Pasting '".$self->{paste}."'");
+        $self->tt_paste($self->locale_encode (delete $self->{paste}));
+    }
+    urxvt::verbose(3, "Leave");
+}
+## }}}
+## }}}
+
+## utxvt perl console factory {{{
+sub urxvt_perlcon {
+    my %arg = @_;
+    my $urxvt = $arg{-urxvt}
+        or die "arg -urxvt required";
+    my $color = $arg{-color} || urxvt::OVERLAY_RSTYLE;
+    my ($command, @mycon);
+    my $urxvt_warn = \&urxvt::warn;
+
+    # TODO Move this away!
+    do {
+        # Redefine URXVT warn
+        *urxvt::warn = sub  {
+            $urxvt_warn->(@_) if ref $urxvt_warn;
+            # TODO FIXME Проблема - когда закрывается окно терминала,
+            # $urxvt уничтожается. Однако, следующая строчка не срабатывает,
+            # что не мещает следующей за ней фэилиться при $urxvt==undef!
+            return unless $urxvt;
+            eval {
+              push @mycon, [ $arg{-color_warn}||$color, $_ ]
+                  for grep { length } split "\n",
+                      $urxvt->locale_decode($_[0]);
+            }; print STDERR "warn (@_) err: $@" if $@; return
+        };
+    };
+    my %cmd;
+    # Command line {{{
+    my $command_editor = urxvt_readline(
+        -urxvt   => $urxvt,
+        -var     => \$command,
+        -x       => 0,
+        -y       => -1,
+        -width   => -1, # $w < 0 ? $self->ncol-%w : $w
+        -max_len => 256,
+        -color   => $color,
+        -prompt  => '$: ',
+        -on_accept => sub {
+            my $cmd = shift
+                or return;
+            my @rv = eval { ($arg{-on_eval}
+                    ||die "-on-eval expected")->($cmd) };
+            push @mycon, [ $arg{-color_cmd}||$color, '# '.$cmd ];
+            urxvt::verbose(3, "Eval $cmd");
+            if ( $@ ) {
+                urxvt::verbose(2, "Eval $cmd fail: $@");
+                push @mycon, [ $arg{-color_err}||$color, $_ ]
+                    for map $urxvt->locale_decode($_),
+                        grep { length } split "\n", $@
+            }
+            push @mycon, [ $arg{-color_rv}||$color, $_ ]
+                for @rv;
+        },
+    ) or do { $urxvt_warn->("Create urxvt_readline fail"); return };
+    # }}}
+    # console {{{
+    my $mycon_pager = urxvt_pager(
+        -urxvt   => $urxvt,
+        -var     => \@mycon,
+        -x       => 0,
+        -y       => -($arg{-width}),
+        -height  => -1,
+        -color   => $color,
+        -border  => 1,
+        -tail    => 1, # Show only last lines
+    ) or do { $urxvt_warn->("Create urxvt_pager fail"); return };
+    # }}}
+    %cmd = (
+        print => sub (@) { push @mycon, [ $color, $_ ] for @_ },
+        lines => sub (;$) {
+            my $re = shift;
+            grep { $re ? /$re/ : 1 }
+            map { ref $_ eq 'ARRAY' ? do
+                { my %a=@{$_}; values %a } : "$_" } @mycon
+        },
+        visible => sub (@) {
+            $command_editor->{visible}->(@_);
+            $mycon_pager->{visible}->(@_);
+            ref($_) eq 'CODE' && $_->( weaken { %cmd } )
+                for @arg{(shift) ? "-on_show" : "-on_hide"}
+        },
+        focus => sub (@) {
+            $command_editor->{focus}->(@_);
+            $mycon_pager->{focus}->(@_);
+            ref($_) eq 'CODE' && $_->( weaken { %cmd } )
+                for @arg{(shift) ? "-on_focus" : "-on_unfocus"}
+        },
+        active => sub (@) {
+            $cmd{visible}->(@_);
+            $cmd{focus}->(@_);
+            ref($_) eq 'CODE' && $_->( weaken { %cmd } )
+                for @arg{(shift) ? "-on_activate" : "-on_deactivate"}
+        },
+        (map { '-edit_' . $_ => $command_editor->{$_} }
+            grep { not /visible/ || /focus/ }
+            keys %{$command_editor}),
+        (map { '-con_' . $_ => $mycon_pager->{$_} }
+            keys %{$mycon_pager}),
+    );
+    # FIXME TODO Ugly! Fun interface.
+    $urxvt->hook_add(
+        x_key_press => sub {
+            my ($key, undef, $char) = @_;
+            # C-c - clean command line
+            ($key eq 'c' and $char eq chr 0x03) ? $command_editor->{clean}->() :
+            # C-l - clean console
+            ($key eq 'l' and $char eq chr 0x0C) ? $mycon_pager->{clean}->() :
+            return ();
+            1
+        },
+    );
+    \%cmd
+}
+## }}}
+
+## urxvt_readline: tiny 'readline' driven by urxvt {{{
+sub urxvt_readline {
+    my %arg = @_;
+    my $urxvt = $arg{-urxvt}
+        or die "arg -urxvt required";
+    my $var = $arg{-var}
+        or die "arg -var required";
+    die "arg -var must be scalar ref"
+        unless ref $var eq 'SCALAR';
+    $arg{-color} ||= urxvt::OVERLAY_RSTYLE;
+    my ($hpos, $pos, $visible, $focus, $oldtlen,
+            @h, @sh, %kh, $ov, %cmd) =
+        (0, 0, $arg{-visible}||0, $arg{-focus}||0, 0);
+    local *mkecmd = sub {
+        my $c = shift;
+        return sub {
+            return unless $visible and $focus;
+            my $v = $c->(@_)
+                and $cmd{'redraw-current-line'}->();
+            1
+        }
+    };
+    %cmd = ( 
+        # Editing command {{{ 
+        # a-la readline
+        # accept, paste {{{
+        'accept-line' => mkecmd(
+            sub {
+                my $v = $$var;
+                if ($v) { 
+                    @sh = ();
+                    $hpos = 0;
+                    # FIXME Hack
+                    shift @h;
+                    # Remove dup
+                    undef ${$kh{$v}} if ref $kh{$v};
+                    unshift @h, $v;
+                    $kh{$v} = \($h[0]);
+                    unshift @h, $v;
+                }
+                if ( ref $arg{-on_accept} eq 'CODE' ) {
+                    eval { $arg{-on_accept}->($v) };
+                    warn "urxvt_readline: on_accept callback eval error $@" if $@;
+                }
+                # Clear text
+                $$var = "";
+                1
+            }),
+        paste => mkecmd(
+            sub {
+                my $t = shift;
+                return unless length $t > 0
+                    and length($arg{-prompt})
+                    + length($$var)
+                    + length $t < $cmd{_width}->();
+                substr $$var, $pos, 0, $t;
+                $pos+=length $t
+            }),
+        clean => mkecmd( sub { $$var = ""; 1 } ),
+        # }}}
+        'backward-delete-char' => mkecmd(
+            sub {
+                return unless $pos > 0;
+                substr $$var, --$pos, 1, "";
+                1
+            }),
+        'forward-delete-char' => mkecmd(
+            sub {
+                return unless $pos >= 0;
+                substr $$var, $pos, 1, "";
+                1
+            }),
+        'beginning-of-line' => mkecmd(
+            sub { $pos = 0; 1 } ),
+        'end-of-line' => mkecmd(
+            sub { $pos = length $$var } ),
+        'backward-char' => mkecmd(
+            sub { $pos > 0 ? $pos-- : 0 }),
+        'forward-char' => mkecmd(
+            sub { $pos < length $$var ? ++$pos : 0 }),
+        'backward-word' => mkecmd(
+            sub {
+                return unless substr($$var, 0, $pos)
+                    =~ /(\w+)\W*$/;
+                $pos = $-[0];
+                1
+            }),
+        'forward-word' => mkecmd(
+            sub {
+                return unless substr($$var, $pos)
+                    =~ /^\w*\W+(\w+)|(\w+)\z/;
+                $pos += $2 ? length $2 : $-[1];
+                1
+            }),
+        # history {{{
+        do {
+            local *h_sh = sub { 
+                my ($fp, $fi) = @_;
+                return sub {
+                    local *v = sub { local $_ = $_[0];
+                        defined $sh[$_] ? $sh[$_] : $h[$_] };
+                    my $s = v(-1)||"";
+                    local $_ = $hpos;
+                    local *pred = length $s
+                        ? sub { substr(v($_), 0, length $s) eq $s }
+                        : sub { defined v($_) };
+                    do { $fi->() } while $fp->() and not &pred;
+                    $hpos = $_ if $fp->() and &pred;
+                    $cmd{'end-of-line'}->();
+                    1
+                } };
+            +(
+                'previous-history' => mkecmd(
+                    h_sh( sub { $_ <= $#h }, sub { $_++ }) ),
+                'next-history' => mkecmd(
+                    h_sh( sub { $_ >= 0 }, sub { $_-- }) ),
+            )
+            # }}}
+        },
+        # }}}
+        # internal {{{   
+        # Get/set visible and focus flags
+        ( map { my $f = $_;
+            $f => sub {
+                my $v = shift;
+                return $visible unless defined $v;
+                ($f eq 'visible' ? $visible : $focus, my $o) =
+                    ($v ? 1 : 0, $f eq 'visible' ? $visible : $focus);
+                $cmd{'redraw-current-line'}->();
+                $o
+            } } qw/visible focus/
+        ),
+        # Just redraw
+        'redraw-current-line' => sub {
+            undef $ov 
+                if not $visible and $ov;
+            return unless $visible;
+            $ov ||= $urxvt->overlay ($arg{-x}, $arg{-y},
+                $cmd{_width}->(), 1, $arg{-color}, 0);
+            my $text = $arg{-prompt}.$$var;
+            for ( length $text ) {
+                $text .= ' ' x ($oldtlen - $_ + 1)
+                    if $oldtlen > $_;
+                $oldtlen = $_;
+            }
+            $pos = length $$var
+                if $pos > length $$var;
+            $pos = 0 if $pos < 0;
+            my $curs_x = $pos + length($arg{-prompt}); # FIXME
+            my $rend = [ map { $arg{-color} | ( $focus
+                    && $_ == $curs_x ? urxvt::RS_RVid : 0 ) }
+                0..length($text) ];
+            $ov->set(0, 0, $text, $rend)
+        },
+        # Return widget width
+        _width => sub { $arg{-width} < 0
+            ? $urxvt->ncol + $arg{-width} : $arg{-width} },
+        # Arguments changing
+        arg => sub {
+                my $k = shift
+                    or return keys %arg;
+                return $arg{$k} unless @_;
+                $arg{$k} = shift;
+                $cmd{'redraw-current-line'}->() },
+        # }}}
+    );
+    # hooks {{{
+    $urxvt->hook_add(
+        # UTXVT-specific only
+        tt_write => sub {
+            local $_ = shift;
+            my $t = shift;
+            # END key
+            /^\e\[4~$/ ? $cmd{'end-of-line'}->() :
+            # HOME key
+            /^\e\[1~$/ ? $cmd{'beginning-of-line'}->() :
+            # C+Left key
+            /^\e\[1;5D$/ ? $cmd{'backward-word'}->() :
+            # C+Right key
+            /^\e\[1;5C$/ ? $cmd{'forward-word'}->() :
+            # Skip other '\[' escapes  (FIXME)
+            /^\e\[/ ? 1 :
+            length $t > 0 ? $cmd{paste}->($t) :
+            return; # Passtrow
+        },
+        x_key_press_Return => $cmd{'accept-line'},
+        x_key_press_KP_Enter => $cmd{'accept-line'},
+        x_key_press_BackSpace => $cmd{'backward-delete-char'},
+        x_key_press_Delete => $cmd{'forward-delete-char'},
+        x_key_press_Left => $cmd{'backward-char'},
+        x_key_press_Right => $cmd{'forward-char'},
+        x_key_press_Up => $cmd{'previous-history'},
+        x_key_press_Down => $cmd{'next-history'},
+    );
+    # }}}
+    # FIXME Need for history and redrawing
+    Tie::Watch->new(
+        -variable => $var,
+        -store => sub {
+            $sh[$hpos] = $_[1];
+            $cmd{'redraw-current-line'}->()
+        },
+        -fetch => sub {
+            defined $sh[$hpos] ? $sh[$hpos]
+                : ($h[$hpos] || "")
+        }
+    );
+    # Show now
+    $cmd{redraw}->() if $arg{-visible};
+    # Controller (hash ref of subs)
+    +{ map { /^_/ ? () : ($_ => $cmd{$_}) } keys %cmd }
+}
+## }}}
+
+## urxvt_pager {{{
+sub urxvt_pager {
+    my %arg = @_;
+    my $urxvt = $arg{-urxvt}
+        or die "arg -urxvt required";
+    my $var = $arg{-var}
+        or die "arg -var required";
+    die "arg -var must be array ref"
+        unless ref $var eq 'ARRAY';
+    weaken $var;
+    $arg{-color} ||= urxvt::OVERLAY_RSTYLE;
+    $arg{-height} ||= $#$var;
+    my ($visible, $focus, $hpos, $vpos, $tail,
+            $ov, $fulldraw, $fullclean, @oldtlen, %cmd) =
+        ($arg{-visible}||0, $arg{-focus}||0, 0, 0, $arg{-tail}||0);
+    my $watch = Tie::Watch->new( # {{{
+        -variable => $var,
+        -store => sub {
+            my ($self, $key, $newval) = @_;
+            $self->Store($key, $newval);
+            $cmd{redraw}->($key)
+        },
+        # FIXME splice (optimization)
+        -push => sub {
+            my ($self, $newval) = @_;
+            my $ol = $#$var;
+            $ol = 0 if $ol < 0;
+            $self->Push($newval);
+            $cmd{redraw}->($ol < $#$var ? ($ol..$#$var) : ())
+        },
+        -storesize => sub {
+            my ($self, $newsize) = @_;
+            $self->Storesize($newsize);
+            ($hpos, $vpos, $fullclean) = (0, 0, 1);
+            $cmd{redraw}->();
+        },
+        # FIXME Autodestroy not woring! 
+        -destroy => sub { $cmd{destroy}->() }
+    );
+    # }}}
+    local *mkecmd = sub { # {{{
+        my $c = shift;
+        return sub {
+            return unless $visible;
+            my @v = $c->(@_)
+                and $cmd{'redraw'}->();
+            @v
+        }
+    }; # }}}
+    %cmd = ( 
+        # Misc command {{{ 
+#         'first-line' => mkecmd(
+#             sub { $vpos=0; 1 } ),
+#         'last-line' => mkecmd(
+#             sub { die "unimplement" } ),
+#         'prev-line' => mkecmd(
+#             sub { $vpos > 0 ? $vpos-- : 0 }),
+#         'next-line' => mkecmd(
+#             sub { $vpos < scalar @$var ? ++$vpos : 0 }),
+        arg => mkecmd(
+            sub {
+                my $k = shift
+                    or return keys %arg;
+                return $arg{$k} unless @_;
+                $arg{$k} = shift;
+                # FIXME in there??
+                undef $ov;
+                $cmd{redraw}->();
+            }),
+        clean => mkecmd(
+            sub { $#$var = -1; () }),
+        # }}}
+        # visible and focus {{{   
+        # Get/set visible and focus flags
+        ( map { my $f = $_;
+            $f => sub {
+                my $v = shift;
+                return $visible unless defined $v;
+                ($f eq 'visible' ? $visible : $focus, my $o) =
+                    ($v ? 1 : 0, $f eq 'visible' ? $visible : $focus);
+                $cmd{redraw}->();
+                $o
+            } } qw/visible focus/
+        ),
+        # }}}
+        # redraw {{{
+        redraw => sub {
+            my $force = shift;
+            undef $ov 
+                if $force or (not $visible and $ov);
+            return unless $visible;
+            unless (defined $var) {
+                $cmd{destroy}->();
+                return
+            }
+            my $span = $arg{-border} ? 2 : 0;
+            my ($w, $h) = map { $cmd{$_}->() } qw/_width _height/;
+            $ov ||= $urxvt->overlay( $cmd{_x}->(), $cmd{_y}->(),
+                $w-$span, $h-$span, $arg{-color}, ($arg{-border} ? 2 : 0) );
+            # FIXME Hack for tail
+            if ( $tail ) {
+                $vpos = ($#$var >= $h - $span) ? ($#$var - ($h - $span) + 1) : 0;
+                $fulldraw++
+            }
+            if ( $fullclean ) {
+                # Hack: clean screen
+                for my $y ( 0..$h-$span ) {
+                    $ov->set(0, $y, ' ' x ($oldtlen[$y]+1))
+                        if ($oldtlen[$y]||0) > 0;
+                    $oldtlen[$y] = 0;
+                }
+                $fullclean = 0
+            }
+            my @lines = grep { $_ >= $vpos and $_ < $vpos+$h-$span }
+                (not $fulldraw and scalar @_) ? @_ : 0..$#$var;
+            $fulldraw = 0 if $fulldraw;
+            # warn "Draw from [$h-$span] $hpos:$vpos (@lines) /$#$var/";
+            for my $i ( @lines ) {
+                my $y = $i - $vpos;
+                my @chunks = ref $var->[$i] ? @{$var->[$i]}
+                    : (0, $var->[$i]);
+                my $x=0;
+                while ( my ($color, $text) = splice @chunks, 0, 2 ) {
+                    $text = substr $text, 0, ($w-$span) - $x
+                        if $x + length $text > $w-$span;
+                    $color ||= $arg{-color};
+                    $ov->set($x, $y, $text,
+                        [ map { $color } 0..length $text ]);
+                    last if ($x += length $text) > $w-$span;
+                }
+                # Clear rest of line
+                $ov->set($x, $y, ' ' x ($oldtlen[$y] - $x + 1))
+                    if ($oldtlen[$y]||0) > $x;
+                $oldtlen[$y] = $x;
+            }
+        },
+        destroy => sub {
+            undef $ov;
+            $watch->Unwatch;
+        },
+        # }}}
+        # internal (hidden) {{{
+        # TODO percentable
+        _x => sub { ($arg{-x}||0) < 0 ? $urxvt->ncol
+            + ($arg{-x}||0) - 1 : $arg{-x} },
+        _y => sub { ($arg{-y}||0) < 0 ? $urxvt->nrow
+            + ($arg{-y}||0) - 1 : $arg{-y} },
+        # Return widget width and height
+        _width => sub { ($arg{-width}||0) <= 0 ? $urxvt->ncol
+            - $cmd{_x}->() + ($arg{-width}||0) : $arg{-width} },
+        _height => sub { ($arg{-height}||0) <= 0 ? $urxvt->nrow
+            - $cmd{_y}->() + $arg{-height}||0 : $arg{-height} },
+        # }}}
+    );
+    # Show now
+    $cmd{redraw}->() if $arg{-visible};
+    # Hooks
+    $urxvt->hook_add(
+        reset => $cmd{redraw},
+    );
+    # Controller (hash ref of subs)
+    +{ map { /^_/ ? () : ($_ => $cmd{$_}) } keys %cmd }
+}
+## }}}
+
+## Hooks {{{
+# Add hooks callbacks only once
+sub hook_add {
+    my ($self, %hooks) = @_;
+    my $h = $self->{hook} ||= {};
+    while ( my ($hm, $cb) = each %hooks ) {
+        my $c = $h->{$hm} ||= [];
+        die "$hm: callback should be code ref, not $cb"
+            unless ref($cb) eq 'CODE';
+        weaken $cb;
+        push @$c, $cb;
+    }
+}
+sub hook {
+    my $self = shift;
+    my $hm = shift or die "usage: hook(\$hookname[, \@args".
+        "[, sub { my \$cb = shift; ...; \$cb->(\@_); ... }]])";
+    my $code = ref $_[-1] eq 'CODE'
+        ? pop(@_) : sub { my $cb = shift; $cb->(@_) };
+    return unless ref( my $c =
+        ($self->{hook} ||= {})->{$hm} ) eq 'ARRAY';
+    my $rv;
+    for my $cb (@$c) {
+        local $_ = $hm;
+        $rv ||= eval { $code->( $cb, @_ ) };
+        warn "Hook $hm fail: $@" if $@;
+    }
+    urxvt::verbose(7, "Hook $hm: $rv");
+    $rv
+}
+sub hooks_activate {
+    $_[0]->enable(
+        tt_write => sub {
+            my ($self, $data) = @_;
+            (my $text = (local $_ = $self->locale_decode($data)))
+                =~ s/[^\p{IsPrint}]//g;
+            urxvt::verbose(5, sprintf("PASTE %i chars: '%s' [%s]",
+                    length, $text, unpack('H*', $text)));
+            my $rv = $self->hook(tt_write => $_, $text, $data);
+            return $rv if $rv;
+            1 # FIXME
+        },
+        key_press => sub {
+            my ($self, $event, $keysym, $string) =  @_;
+            my $key = $self->XKeysymToString($keysym);
+            $string = $self->locale_decode($string);
+            urxvt::verbose(6, sprintf("KEY PRESS: 0x%X (%s) - '%s'",
+                    $keysym, $key, $string));
+            my $rv = $self->hook("x_key_press_$key" => $keysym, $string)
+                if $key;
+            $rv ||= $self->hook(x_key_press => $key, $keysym, $string);
+            return $rv if $rv;
+            ()
+        },
+        key_release => sub {
+            my ($self, $event, $keysym, $string) =  @_;
+            my $key = $self->XKeysymToString($keysym);
+            urxvt::verbose(6, sprintf("KEY RELES: 0x%X (%s) - '%s'",
+                    $keysym, $key, $string));
+            my $rv = $self->hook("x_key_release_$key" => $keysym, $string)
+                if $key;
+            $rv ||= $self->hook(x_key_release => $key, $keysym, $string);
+            return $rv if $rv;
+            ()
+        },
+        reset => sub {
+            my $rv = shift->hook(reset => 1);
+            return $rv if $rv;
+            ()
+        },
+    )
+}
+sub hooks_deactivate {
+    $_[0]->disable ("key_press", "key_release", "tt_write", "reset");
+}
+## }}}
+
+1
