@@ -114,6 +114,35 @@ def newtermptysys => sub ($@) {#{{{
         close $pty;
         # now communicate with new rxvt
         $pty->slave };#}}}
+# FIXME From perlcon!!!
+def defcolor => sub () { urxvt::SET_COLOR(urxvt::OVERLAY_RSTYLE, 77, 1) };
+# Pager#{{{
+# newpager :: ArrayRef -> PagerArgsHash -> PagerHandle
+def newpager => sub (@) {#{{{
+  my $v = shift or die "var expected";
+  urxvt::ext::perlcon::urxvt_pager 
+    -var => $v,
+    -y => 1,
+    -x => 82,
+    -tail => 1,
+    -width => 37,
+    -height => 3,
+    -border => 1,
+    -color => defcolor(),
+    @_, -urxvt => term() };#}}}
+# pager :: PagerArgsHash -> PagerHandle
+def pager => sub (@) { my $v = []; newpager($v, @_) };
+def parg => sub ($@) { my $h=shift; $h->{arg}->(@_) }; # >>=
+# pvar :: PagerHandle -> ArrayRef
+def pvar => sub ($) { ($_[0]->{arg}->(-var))[0] }; # FIXME Ugly
+def ppush => sub (@) { push @{pvar($_[0])}, @_[1..$#_] };
+# pvisible :: Maybe Bool -> PagerHandle -> Bool
+def psetvisible => sub ($\$) { shift->{visible}->(shift) };
+def pvisible => sub ($) { psetvisible(undef, shift) };
+def pshow => sub ($) { psetvisible(1, shift) };
+def phide => sub ($) { psetvisible(0, shift) };
+def pdestroy => sub ($) { shift->{destroy}->() };
+#}}}
 #}}}
 
 ## pcon relate#{{{
@@ -236,6 +265,24 @@ def head => sub (@) { $_[0] };
 def tail => sub (@) { @_[1..$#_] };
 def sl => sub () { head(selarea()) };
 def l => sub (@) { map term()->ROW_t($_), scalar @_ ? @_ : sl() };
+do { my %ppp; # ppp: new pager, create handler shotcut#{{{
+  # FIXME Ugggly...
+  def ppp => sub ($@) {
+    my $k = shift or return keys %ppp;
+    pdestroy($ppp{$k}), delete $ppp{$k} if $ppp{$k};
+    $ppp{$k} = pager(@_) or die "pager failed";
+    # FIXME Why it this?
+    def($k => sub { $ppp{$k} });
+    $ppp{$k} } };#}}}
+def clock => sub (@) {#{{{
+  ppp(_clock =>
+    -width => 21,
+    -y => -1,
+    -x => -21,
+    @_);
+  my $t = timer(sub { ppush(_clock(), ts()) }, 1);
+  def '_clock_t' => sub { $t }; # FIXME So ugggly...
+  pshow(_clock()) };#}}}
 #}}}
 
 def pty => sub {#{{{
